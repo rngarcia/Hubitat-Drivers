@@ -176,7 +176,7 @@ void reinitialize() {
 void reconcileChildDevices() {
   String componentStr = device.getDataValue('components')
   if (!componentStr) {
-    logWarn('No components data value found — skipping child reconciliation')
+    logWarn('No components data value found - skipping child reconciliation')
     return
   }
 
@@ -475,7 +475,7 @@ private void routeWebhookNotification(Map params) {
   // so they go through the hub-side gesture classifier. When the WebSocket is
   // connected it already delivers the same presses, so the webhook is ignored.
   if (dst == 'input_push' || dst == 'input_toggle_on') {
-    if (device.currentValue('webSocket') == 'connected') {
+    if (isWebSocketOpen()) {
       logTrace("Ignoring ${dst} webhook for input ${params.cid} (WebSocket active)")
     } else {
       onInputPress(params.cid as Integer)
@@ -796,7 +796,18 @@ void connectWebSocket() {
   wsConnect()
 }
 
+/**
+ * Connection state is tracked in memory: device.currentValue() can still return
+ * the previous value right after sendEvent() in the same execution.
+ *
+ * @return true if the WebSocket is enabled and currently open
+ */
+private Boolean isWebSocketOpen() {
+  return settings?.enableWebSocket == true && wsOpen.get(device.id.toString()) == true
+}
+
 private void wsClose() {
+  wsOpen.put(device.id.toString(), false)
   try {
     interfaces.webSocket.close()
   } catch (Exception ignored) { }
@@ -810,6 +821,7 @@ private void wsClose() {
 void webSocketStatus(String message) {
   logDebug("webSocketStatus: ${message}")
   if (message?.startsWith('status: open')) {
+    wsOpen.put(device.id.toString(), true)
     state.wsRetrySeconds = WS_RETRY_MIN_SECONDS
     state.wsLastMessage = now()
     sendEventIfChanged('webSocket', 'connected')
@@ -817,9 +829,10 @@ void webSocketStatus(String message) {
     wsCall('Shelly.GetStatus', [:], 'fullStatus')
     wsCall('Media.List', [type: 'ringtone'], 'ringtones')
   } else if (message?.startsWith('status: closing') || message?.startsWith('failure')) {
+    wsOpen.put(device.id.toString(), false)
     sendEventIfChanged('webSocket', 'disconnected')
     if (settings?.enableWebSocket == true) {
-      logWarn("WebSocket ${message} — reconnecting in ${state.wsRetrySeconds ?: WS_RETRY_MIN_SECONDS}s")
+      logWarn("WebSocket ${message} - reconnecting in ${state.wsRetrySeconds ?: WS_RETRY_MIN_SECONDS}s")
       wsScheduleReconnect()
     }
   }
@@ -839,7 +852,7 @@ void wsWatchdog() {
   if (settings?.enableWebSocket != true) { return }
   Long last = (state.wsLastMessage ?: 0L) as Long
   if (now() - last > WS_STALE_MS) {
-    logWarn('WebSocket silent for too long — reconnecting')
+    logWarn('WebSocket silent for too long - reconnecting')
     sendEventIfChanged('webSocket', 'reconnecting')
     wsConnect()
   }
@@ -854,9 +867,7 @@ void wsWatchdog() {
  * @return true if the request was sent, false if the socket is not connected
  */
 private Boolean wsCall(String method, Map params, String purpose = '') {
-  if (settings?.enableWebSocket != true || device.currentValue('webSocket') != 'connected') {
-    return false
-  }
+  if (!isWebSocketOpen()) { return false }
   Integer id = nextRpcId()
   if (purpose) { pendingRpc.put("${device.id}:${id}".toString(), purpose) }
   Map req = [id: id, src: "hubitat-${device.id}".toString(), method: method, params: params ?: [:]]
@@ -941,17 +952,13 @@ private void applyStatusDelta(Map status) {
     if (!(v instanceof Map)) { return }
     Map data = v as Map
     if (key.startsWith('motion:') && data.motion != null) {
-      sendEventIfChanged('motion', data.motion ? 'active' : 'inactive')
-      changed = true
+      changed |= sendEventIfChanged('motion', data.motion ? 'active' : 'inactive')
     } else if (key.startsWith('illuminance:') && data.lux != null) {
-      sendEventIfChanged('illuminance', data.lux as Integer, 'lux')
-      changed = true
+      changed |= sendEventIfChanged('illuminance', data.lux as Integer, 'lux')
     } else if (key.startsWith('switch:') && data.output != null) {
-      applySwitchDelta(key.split(':')[1] as Integer, data.output as Boolean)
-      changed = true
+      changed |= applySwitchDelta(key.split(':')[1] as Integer, data.output as Boolean)
     } else if (key == 'media') {
-      applyMediaStatus(data)
-      changed = true
+      changed |= applyMediaStatus(data)
     } else if (key.startsWith('temperature:') && hasUsableTemperature(data)) {
       String scale = getLocationHelper()?.temperatureScale ?: 'F'
       BigDecimal temp = getWebhookTemperatureValue([tC: data.tC, tF: data.tF], scale)
@@ -976,9 +983,11 @@ private void applyStatusDelta(Map status) {
  *
  * @param switchId Shelly switch id
  * @param isOn New output state
+ * @return true if an event was sent
  */
-private void applySwitchDelta(Integer switchId, Boolean isOn) {
+private Boolean applySwitchDelta(Integer switchId, Boolean isOn) {
   String switchState = isOn ? 'on' : 'off'
+  Boolean changed = true
   if (isMultiSwitchDevice()) {
     def child = getChildDevice("${device.deviceNetworkId}-switch-${switchId}")
     if (child) {
@@ -986,9 +995,10 @@ private void applySwitchDelta(Integer switchId, Boolean isOn) {
       child.sendEvent(name: 'lastUpdated', value: new Date().format('yyyy-MM-dd HH:mm:ss'))
     }
   } else {
-    sendEventIfChanged('switch', switchState)
+    changed = sendEventIfChanged('switch', switchState)
   }
   setSwitchState(switchId, isOn)
+  return changed
 }
 
 /**
@@ -1223,16 +1233,18 @@ void unmute() {
   setVolume(restore as BigDecimal)
 }
 
-private void applyMediaStatus(Map media) {
+private Boolean applyMediaStatus(Map media) {
   Map playback = (media.playback instanceof Map) ? media.playback as Map : [:]
+  Boolean changed = false
   if (playback.volume != null) {
     Integer vol = (playback.volume as Integer) * 10
-    sendEventIfChanged('volume', vol, '%')
-    sendEventIfChanged('mute', vol == 0 ? 'muted' : 'unmuted')
+    changed |= sendEventIfChanged('volume', vol, '%')
+    changed |= sendEventIfChanged('mute', vol == 0 ? 'muted' : 'unmuted')
   }
   if (playback.enable != null) {
-    sendEventIfChanged('status', playback.enable ? 'playing' : 'stopped')
+    changed |= sendEventIfChanged('status', playback.enable ? 'playing' : 'stopped')
   }
+  return changed
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
@@ -1251,12 +1263,15 @@ private Object getLocationHelper() {
 
 /**
  * Sends an event only when the attribute value actually changes.
+ *
+ * @return true if an event was sent
  */
-private void sendEventIfChanged(String name, Object value, String unit = null) {
-  if (device.currentValue(name)?.toString() == value?.toString()) { return }
+private Boolean sendEventIfChanged(String name, Object value, String unit = null) {
+  if (device.currentValue(name)?.toString() == value?.toString()) { return false }
   Map evt = [name: name, value: value]
   if (unit) { evt.unit = unit }
   sendEvent(evt)
+  return true
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
@@ -1332,6 +1347,8 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Outstanding WebSocket RPC requests, keyed "deviceId:rpcId" -> purpose. */
 @Field static ConcurrentHashMap<String, String> pendingRpc = new ConcurrentHashMap<String, String>()
 @Field static AtomicInteger rpcCounter = new AtomicInteger(0)
+/** WebSocket open flag per device id. */
+@Field static ConcurrentHashMap<String, Boolean> wsOpen = new ConcurrentHashMap<String, Boolean>()
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  END Imports And Fields                                       ║
 // ╚══════════════════════════════════════════════════════════════╝

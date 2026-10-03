@@ -28,7 +28,9 @@
  *     - Physical buttons: push / double / triple / hold / release classified on the hub
  *       from the firmware's single_push stream (autorepeat ~50 ms while held)
  *     - MotionSensor (radar motion:0) and media/volume/ringtone state
- *     - Touch gestures (swipe up/down, multi-touch) as the 'gesture' attribute
+ *     - Touch gestures (swipe up/down, multi-touch) as the 'gesture' attribute and as
+       parent buttons 1/2/3 (Button Controller friendly)
+     - No lastUpdated event on button events (halves event writes per press)
  *     - Commands: screen on/off, screen brightness, Chime (ringtones), AudioVolume,
  *       media play/stop/next/previous
  *     - Webhook routes for motion_start/end and touch_* events; input_push and
@@ -245,9 +247,40 @@ void reconcileChildDevices() {
     }
   }
 
-  if (inputCount == 1) {
-    sendEvent(name: 'numberOfButtons', value: 1)
+  // Parent buttons: touch gestures (swipe up / swipe down / multi-touch), numbered
+  // after the single input when inputs are not split into children
+  Integer buttons = getGestureButtonOffset() + GESTURE_NAMES.size()
+  if (device.currentValue('numberOfButtons')?.toString() != buttons.toString()) {
+    sendEvent(name: 'numberOfButtons', value: buttons)
   }
+}
+
+/**
+ * First parent button number used for touch gestures minus one. Gestures are
+ * buttons 1-3 when inputs have their own child devices; otherwise they follow
+ * the input button numbers used on the parent.
+ *
+ * @return Offset added to the gesture index (1-based)
+ */
+private Integer getGestureButtonOffset() {
+  Integer inputCount = getComponentIds('input').size()
+  return inputCount > 1 ? 0 : inputCount
+}
+
+/**
+ * Reports a touch gesture both as the 'gesture' attribute (for rules on the
+ * attribute) and as a parent button press (for Button Controller):
+ * swipe up = 1, swipe down = 2, multi-touch = 3 (plus offset).
+ *
+ * @param eventKey Firmware event / webhook dst, e.g. 'touch_swipe_up'
+ */
+private void emitGesture(String eventKey) {
+  String gestureName = GESTURE_NAMES[eventKey]
+  if (!gestureName) { return }
+  Integer button = getGestureButtonOffset() + (GESTURE_NAMES.keySet() as List).indexOf(eventKey) + 1
+  sendEvent(name: 'gesture', value: gestureName, isStateChange: true, descriptionText: "Touch gesture: ${gestureName}")
+  sendEvent(name: 'pushed', value: button, isStateChange: true, descriptionText: "Button ${button} (${gestureName}) was pushed")
+  logInfo("Gesture ${gestureName} -> button ${button}")
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
@@ -471,6 +504,12 @@ private void routeWebhookNotification(Map params) {
   String dst = params.dst
   if (!dst || params.cid == null) { return }
 
+  // Touch gestures -> 'gesture' attribute + parent button events
+  if (GESTURE_NAMES.containsKey(dst)) {
+    emitGesture(dst)
+    return
+  }
+
   // Physical button presses: the Wall Display only reports raw presses (toggle_on),
   // so they go through the hub-side gesture classifier. When the WebSocket is
   // connected it already delivers the same presses, so the webhook is ignored.
@@ -603,12 +642,6 @@ private List<Map> buildWebhookEvents(String dst, Map params) {
       break
     case 'motion_end':
       events.add([name: 'motion', value: 'inactive', descriptionText: 'Motion cleared'])
-      break
-    case 'touch_swipe_up':
-    case 'touch_swipe_down':
-    case 'touch_multi_touch':
-      String gestureName = GESTURE_NAMES[dst]
-      events.add([name: 'gesture', value: gestureName, isStateChange: true, descriptionText: "Touch gesture: ${gestureName}"])
       break
   }
 
@@ -1019,8 +1052,7 @@ private void handleDeviceEvent(Map e) {
   logTrace("WS event ${component} id=${id} ${event}")
 
   if (GESTURE_NAMES.containsKey(event)) {
-    String gestureName = GESTURE_NAMES[event]
-    sendEvent(name: 'gesture', value: gestureName, isStateChange: true, descriptionText: "Touch gesture: ${gestureName}")
+    emitGesture(event)
     return
   }
   if (baseType != 'input') { return }
@@ -1140,8 +1172,8 @@ private Integer getTapWindowMs() {
 }
 
 /**
- * Sends a button event to the matching Input child (or to the parent when the
- * device has a single input, using the input id as button number).
+ * Sends a button event to the matching Input child (or to the parent as
+ * button 1 when the device has a single input).
  *
  * @param inputId Shelly input id
  * @param eventName pushed | doubleTapped | tripleTapped | held | released
@@ -1149,12 +1181,12 @@ private Integer getTapWindowMs() {
 private void emitButtonEvent(Integer inputId, String eventName) {
   String verb = BUTTON_EVENT_VERBS[eventName] ?: eventName
   def child = getChildDevice("${device.deviceNetworkId}-input-${inputId}")
-  String nowStr = new Date().format('yyyy-MM-dd HH:mm:ss')
+  // No lastUpdated here: button events are already timestamped state changes
   if (child) {
     child.sendEvent(name: eventName, value: 1, isStateChange: true, descriptionText: "Button 1 was ${verb}")
-    child.sendEvent(name: 'lastUpdated', value: nowStr)
   } else {
-    sendEvent(name: eventName, value: inputId, isStateChange: true, descriptionText: "Button ${inputId} was ${verb}")
+    // Single input on the parent is button 1 (gestures follow as 2-4)
+    sendEvent(name: eventName, value: 1, isStateChange: true, descriptionText: "Button 1 was ${verb}")
   }
   logInfo("Input ${inputId}: ${eventName}")
 }

@@ -830,6 +830,11 @@ void webSocketStatus(String message) {
     wsCall('Media.List', [type: 'ringtone'], 'ringtones')
   } else if (message?.startsWith('status: closing') || message?.startsWith('failure')) {
     wsOpen.put(device.id.toString(), false)
+    if (settings?.enableWebSocket != true) {
+      // Expected close after the preference was turned off
+      sendEventIfChanged('webSocket', 'disabled')
+      return
+    }
     sendEventIfChanged('webSocket', 'disconnected')
     if (settings?.enableWebSocket == true) {
       logWarn("WebSocket ${message} - reconnecting in ${state.wsRetrySeconds ?: WS_RETRY_MIN_SECONDS}s")
